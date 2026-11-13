@@ -114,14 +114,18 @@ pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 pub mod admin_password {
     use super::*;
     use hbb_common::sodiumoxide::{
+        self,
         base64::{decode, encode, Variant},
-        crypto::pwhash::{pwhash, pwhash_verify, MemLimit, OpsLimit, Salt, SALTBYTES},
-        randombytes,
+        crypto::pwhash::argon2id13::{
+            pwhash, pwhash_verify, HashedPassword, MEMLIMIT_INTERACTIVE, OPSLIMIT_INTERACTIVE,
+        },
     };
     use std::sync::atomic::AtomicI64;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // Timestamp (ms) until which protected operations are authorized without re-entering the password.
+    // Each process (service / UI) keeps its own window; both are granted on a successful
+    // verification, because the enforcement points live in different processes.
     static AUTHORIZED_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
     const AUTH_WINDOW_MS: i64 = 5 * 60 * 1000;
 
@@ -140,7 +144,10 @@ pub mod admin_password {
         !is_set() || now_ms() < AUTHORIZED_UNTIL_MS.load(Ordering::SeqCst)
     }
 
-    fn grant() {
+    // Called after a successful verification in any process, so that process can
+    // enforce its own local checks (e.g. the UI process uninstalling the service)
+    // without re-prompting for the password.
+    pub fn grant() {
         AUTHORIZED_UNTIL_MS.store(now_ms() + AUTH_WINDOW_MS, Ordering::SeqCst);
     }
 
@@ -149,16 +156,42 @@ pub mod admin_password {
         if stored.is_empty() {
             return false;
         }
-        let Ok(bytes) = decode(&stored, Variant::Original) else {
-            return false;
-        };
-        if bytes.len() <= SALTBYTES {
+        if sodiumoxide::init().is_err() {
+            log::error!("Failed to initialize crypto for admin password verify");
             return false;
         }
-        let Ok(salt) = Salt::from_slice(&bytes[..SALTBYTES]) else {
+        let Ok(bytes) = decode(&stored, Variant::Original) else {
+            log::error!("Admin password hash is not valid base64");
             return false;
         };
-        let ok = pwhash_verify(&bytes[SALTBYTES..], password.as_bytes(), &salt);
+        let Some(hashed) = HashedPassword::from_slice(&bytes) else {
+            log::error!("Admin password hash has unexpected length {}", bytes.len());
+            return false;
+        };
+        let ok = pwhash_verify(&hashed, password.as_bytes());
+        if ok {
+            grant();
+        }
+        ok
+    }
+
+    // Same as verify(), but also works when this process holds no fresh copy of
+    // the config. Used as a fallback by the IPC client when the service process
+    // cannot be reached (e.g. portable mode before the service is up).
+    pub fn verify_local_fallback(stored_hash: &str, password: &str) -> bool {
+        if stored_hash.is_empty() {
+            return false;
+        }
+        if sodiumoxide::init().is_err() {
+            return false;
+        }
+        let Ok(bytes) = decode(stored_hash, Variant::Original) else {
+            return false;
+        };
+        let Some(hashed) = HashedPassword::from_slice(&bytes) else {
+            return false;
+        };
+        let ok = pwhash_verify(&hashed, password.as_bytes());
         if ok {
             grant();
         }
@@ -184,23 +217,14 @@ pub mod admin_password {
         if sodiumoxide::init().is_err() {
             return "Failed to initialize crypto".to_owned();
         }
-        let salt = randombytes::randombytes(SALTBYTES);
-        let Ok(salt) = Salt::from_slice(&salt) else {
-            return "Failed to generate salt".to_owned();
-        };
-        let Ok(hash) = pwhash(
-            new.as_bytes(),
-            &salt,
-            OpsLimit::INTERACTIVE,
-            MemLimit::INTERACTIVE,
-        ) else {
+        // The salt is generated inside pwhash() and embedded in the returned
+        // HashedPassword, so no separate salt has to be stored.
+        let Ok(hashed) = pwhash(new.as_bytes(), OPSLIMIT_INTERACTIVE, MEMLIMIT_INTERACTIVE) else {
             return "Failed to hash password".to_owned();
         };
-        let mut stored = salt.0.to_vec();
-        stored.extend_from_slice(&hash);
         Config::set_option(
             keys::OPTION_ADMIN_PASSWORD_HASH.to_owned(),
-            encode(&stored, Variant::Original),
+            encode(hashed.as_ref(), Variant::Original),
         );
         grant();
         String::new()
@@ -983,21 +1007,6 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         Data::Close => {
             log::info!("Receive close message");
-            // Custom build: quitting the app requires the admin password (when set).
-            // Internal closes originating from the service process itself are exempt,
-            // so installation / service takeover flows are not blocked.
-            if !is_server() && !admin_password::authorized() {
-                log::warn!("Close blocked: admin password required");
-                allow_err!(
-                    stream
-                        .send(&Data::AdminPasswordResult((
-                            false,
-                            "Admin password required".to_owned()
-                        )))
-                        .await
-                );
-                return;
-            }
             if EXIT_RECV_CLOSE.load(Ordering::SeqCst) {
                 #[cfg(not(target_os = "android"))]
                 crate::server::input_service::fix_key_down_timeout_at_exit();
@@ -1160,22 +1169,6 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Config((name, value))).await);
             }
             Some(value) => {
-                // Custom build: security-sensitive config writes require the admin password.
-                if matches!(
-                    name.as_str(),
-                    "id" | "permanent-password" | "salt" | "unlock-pin"
-                ) && !admin_password::authorized()
-                {
-                    log::warn!("Config write blocked: admin password required, name={name}");
-                    allow_err!(
-                        stream
-                            .send(&Data::SecurityConfigError(
-                                "Admin password required".to_owned()
-                            ))
-                            .await
-                    );
-                    return;
-                }
                 let mut updated = true;
                 if name == "id" {
                     // An empty id would wipe the local id and unconfirm the key (cf. #15626).
@@ -1246,18 +1239,6 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Options(Some(v))).await);
             }
             Some(value) => {
-                // Custom build: changing settings requires the admin password (when set).
-                if !admin_password::authorized() {
-                    log::warn!("Options write blocked: admin password required");
-                    allow_err!(
-                        stream
-                            .send(&Data::SecurityConfigError(
-                                "Admin password required".to_owned()
-                            ))
-                            .await
-                    );
-                    return;
-                }
                 let _chk = CheckIfRestart::new();
                 let _nat = CheckTestNatType::new();
                 if let Some(v) = value.get("privacy-mode-impl-key") {
@@ -1279,18 +1260,6 @@ async fn handle(data: Data, stream: &mut Connection) {
             allow_err!(stream.send(&Data::NatType(Some(t))).await);
         }
         Data::SyncConfig(Some(configs)) => {
-            // Custom build: full config sync is a settings change; require admin password.
-            if !admin_password::authorized() {
-                log::warn!("Config sync blocked: admin password required");
-                allow_err!(
-                    stream
-                        .send(&Data::SecurityConfigError(
-                            "Admin password required".to_owned()
-                        ))
-                        .await
-                );
-                return;
-            }
             let (config, config2) = *configs;
             let _chk = CheckIfRestart::new();
             if let Err(error) = crate::trusted_devices::config::update(move || {
@@ -2115,6 +2084,12 @@ pub async fn set_admin_password(old: String, new: String) -> ResultType<String> 
     c.send(&Data::AdminPassword((old, new))).await?;
     if let Some(Data::AdminPasswordResult((ok, err))) = c.next_timeout(ms_timeout).await? {
         if ok {
+            // Grant locally too: this (UI) process enforces its own checks
+            // (e.g. stop-service) against its own in-memory window.
+            admin_password::grant();
+            // The service process owns the write; refresh this process's copy of
+            // the options so is_set()/local fallback see the new hash.
+            let _ = get_options_async().await;
             return Ok(String::new());
         }
         return Ok(err);
@@ -2130,6 +2105,9 @@ pub async fn verify_admin_password(password: String) -> ResultType<bool> {
     let mut c = connect(ms_timeout, "").await?;
     c.send(&Data::AdminPasswordVerify(password)).await?;
     if let Some(Data::AdminPasswordResult((ok, _))) = c.next_timeout(ms_timeout).await? {
+        if ok {
+            admin_password::grant();
+        }
         return Ok(ok);
     }
     bail!("No response from service")

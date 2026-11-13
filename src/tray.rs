@@ -67,10 +67,22 @@ fn make_tray() -> hbb_common::ResultType<()> {
     // Custom build: when an admin password is set, hide "Stop service" from the tray.
     // The native tray menu cannot show the Flutter password dialog, so the only safe
     // option is to remove the entry; stopping stays available (password-gated) in Settings.
+    // `is_admin_password_set` only exists in flutter builds, so the extra condition
+    // is gated on that feature.
+    let admin_pw_set = {
+        #[cfg(feature = "flutter")]
+        {
+            crate::ui_interface::is_admin_password_set()
+        }
+        #[cfg(not(feature = "flutter"))]
+        {
+            false
+        }
+    };
     let hide_stop_service = crate::ui_interface::get_builtin_option(
         keys::OPTION_HIDE_STOP_SERVICE,
     ) == "Y"
-        || crate::ui_interface::is_admin_password_set();
+        || admin_pw_set;
     // The tray icon is only shown when the service is running, so we don't need to check
     // the `stop-service` option here.
     let quit_i = if !hide_stop_service {

@@ -1777,7 +1777,15 @@ pub fn verify_admin_password(password: String) -> bool {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     return true;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return ipc::verify_admin_password(password).unwrap_or(false);
+    {
+        if let Ok(ok) = ipc::verify_admin_password(password.clone()) {
+            return ok;
+        }
+        // The service process may not be reachable (e.g. portable mode before the
+        // service is up). Fall back to verifying against the locally stored hash.
+        let stored = Config::get_option(keys::OPTION_ADMIN_PASSWORD_HASH);
+        ipc::admin_password::verify_local_fallback(&stored, &password)
+    }
 }
 
 #[cfg(feature = "flutter")]
@@ -1785,7 +1793,13 @@ pub fn is_admin_password_set() -> bool {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     return false;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return ipc::is_admin_password_set().unwrap_or(false);
+    {
+        if let Ok(set) = ipc::is_admin_password_set() {
+            return set;
+        }
+        // Fallback: the option lives in the shared config file.
+        return !Config::get_option(keys::OPTION_ADMIN_PASSWORD_HASH).is_empty();
+    }
 }
 
 #[cfg(feature = "flutter")]

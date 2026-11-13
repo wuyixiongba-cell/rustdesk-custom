@@ -2232,8 +2232,11 @@ pub fn main_set_unlock_pin(pin: String) -> SyncReturn<String> {
 }
 
 // ===== Custom build: admin password protection =====
-pub fn main_set_admin_password(old: String, new: String) -> SyncReturn<String> {
-    SyncReturn(set_admin_password(old, new))
+pub fn main_set_admin_password(
+    old_password: String,
+    new_password: String,
+) -> SyncReturn<String> {
+    SyncReturn(set_admin_password(old_password, new_password))
 }
 
 pub fn main_verify_admin_password(password: String) -> SyncReturn<bool> {

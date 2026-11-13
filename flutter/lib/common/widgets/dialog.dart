@@ -2831,8 +2831,8 @@ void changeAdminPasswordDialog(Function() callback) {
         });
         return;
       }
-      final errorMsg =
-          bind.mainSetAdminPassword(old: oldPwd, new: newPwd);
+      final errorMsg = bind.mainSetAdminPassword(
+          oldPassword: oldPwd, newPassword: newPwd);
       if (errorMsg != '') {
         setState(() {
           if (hasPassword && errorMsg == 'Wrong admin password') {
