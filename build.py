@@ -779,6 +779,10 @@ def build_flutter_deb(version, features):
     if ships_so:
         retarget_control_to_drm_variant()
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
+    # Custom build: ensure the maintainer scripts are executable. Checkouts that
+    # do not carry the Unix mode bit (e.g. sources unpacked from an archive) make
+    # dpkg-deb fail with "maintainer script 'preinst' has bad permissions 644".
+    system2('chmod 0755 tmpdeb/DEBIAN/* || true')
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
@@ -920,6 +924,8 @@ def build_deb_from_folder(version, binary_folder, want_drm=False):
     if want_drm:
         retarget_control_to_drm_variant()
     system2('cp -a ../res/DEBIAN/* tmpdeb/DEBIAN/')
+    # Custom build: same executable-mode guarantee as the flutter deb path.
+    system2('chmod 0755 tmpdeb/DEBIAN/* || true')
     md5_file_folder("tmpdeb/")
     system2('dpkg-deb -b tmpdeb rustdesk.deb;')
 
